@@ -10,6 +10,7 @@ Statistical and computational network analysis of the human connectome using gra
 ##  Academic Context
 * **Authors:** Giorgia Cappellato, Matteo Cristina, Elisa Quadrini
 * **Course:** Statistical and Computational Methods for Network Data
+* **Institution:** Università Cattolica del Sacro Cuore
 
 ##  Dataset & Preprocessing
 The network is built upon Diffusion MRI (dMRI) scans of 477 healthy individuals from the Human Connectome Project (HCP), mapped across 1,015 distinct brain regions. 
