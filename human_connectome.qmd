@@ -1,0 +1,995 @@
+---
+title: "Human Connectome Analysis"
+format: html
+editor: visual
+---
+
+Library used and seed set:
+
+```{r, warning=FALSE, message=FALSE}
+library(knitr)
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+library(patchwork)
+library(ggraph)
+library(tibble)
+library(statnet)
+library(intergraph) 
+library(ergm)
+library(stringr)
+library(igraph)
+
+set.seed(1)
+```
+
+## 1. Dataset description and Network Architecture
+
+The Budapest Reference Connectome 3.0 dataset is a comprehensive wiring diagram of the average, healthy human brain. Built by merging brain scans from 477 individuals, this dataset maps the physical pathways between 1,015 distinct regions of the brain. A connectome is a complete map of the neural connections in a brain.
+
+Grey Matter (the Nodes): This is where the actual processing happens. It is made up of the bodies of the brain cells. It is located mostly on the outer surface of the brain (the cortex). In a network analysis, grey matter regions act as the "nodes" or hubs.
+
+White Matter (the Edges): These are the communication cables. They are long nerve fibers (axons) that connect different regions of grey matter.
+
+The original raw brain scans were collected by the Human Connectome Project (HCP), a major scientific consortium funded by the U.S. National Institutes of Health and later assembled by bioinformatics researchers at the PIT Bioinformatics Group at Eötvös Loránd University in Budapest. The raw MRI data was collected from healthy adults during the early 2010s.
+
+The original researchers used a specialized scanning technique called Diffusion MRI (dMRI). Unlike standard MRIs that just show tissue structure, dMRI tracks the microscopic movement of water molecules inside the brain. Because water naturally flows along the length of nerve fibers rather than across them, algorithms can map these water pathways to reveal the brain's white matter cables.
+
+This project uses network analysis to uncover the mathematical and structural patterns of how our brains are wired to share information.
+
+### 1.1 Edge Weighting and Metrics
+
+Load the dataset:
+
+```{r}
+edges = read.csv("all_20k.csv/edges.csv")
+nodes = read.csv("all_20k.csv/nodes.csv")
+```
+
+Structure:
+
+```{r}
+edges_tibble <- as_tibble(edges)
+edges_tibble
+```
+
+Edges (71,604 observations): represent the physical and electrical white-matter connections between brain regions.
+
+- X..source (Integer): The ID of the starting node/region.
+
+- target (Integer): The ID of the ending node/region.
+
+- fiber_count_mean (Numeric): The average number of axonal tracts/fibers connecting the two nodes across the consensus group.
+
+- fiber_length_mean (Numeric): The average physical length of the connecting fibers (usually in millimeters).
+
+- fractional_anisotropy_mean (Numeric): A value between 0 and 1 representing the structural integrity and directionality of the white matter tract (derived from diffusion MRI).
+
+- electrical_connectivity_median (Numeric) The median estimated electrical conductance or connection strength between the regions.
+
+- fiber_count_median (Numeric): The median number of connecting fibers.
+
+- fiber_length_median (Numeric): The median physical length of the fibers.
+
+- fractional_anisotropy_median (Numeric): The median fractional anisotropy.
+
+- occurences (Integer) The number of individual brains (out of the 477 subjects) that actually possess this specific connection/edge.
+
+```{r}
+nodes_tibble <- tibble(nodes)
+nodes_tibble
+```
+
+Nodes (1,015 observations): represent the specific anatomical brain regions (parcellations).
+
+- X..index (Integer): The unique identifier for the region (matches source/target in edges).
+
+- dn_fsname (Character): The base anatomical name of the region based on the FreeSurfer atlas.
+
+- dn_hemisphere (Character): The hemisphere the region is located in ("right" or "left").
+
+- dn_name (Character): The full anatomical identifier (combines hemisphere and FreeSurfer name).
+
+- dn_region (Character): The broad tissue category of the region (e.g., "cortical", "subcortical").
+
+- X_pos (Character): The 2D/3D spatial coordinates of the node.
+
+This analysis will focus primarily on two key network edge attributes: **fiber_count_mean** and **electrical_connectivity_median**. These are arguably the most critical variables for understanding the network because they measure connection strength in two complementary ways.
+
+**fiber_count_mean** represents the physical robustness of a connection, literally counting the average number of nerve fibers that bundle together to link two brain regions. However, physical bulk does not guarantee signal speed. Therefore, we also analyze **electrical_connectivity_median**, which estimates the functional efficiency of the pathway (how well electrical signals actually travel down those fibers).
+
+### 1.2 Network preprocess
+
+We removed self-loops (connections where a brain region links back to itself) from our data. While brain regions do have internal wiring, our goal is to map how different areas communicate with each other. Ignoring these self connections gives us a clearer, more accurate picture of the overall network.
+
+```{r}
+g <- graph_from_data_frame(d = edges, vertices = nodes, directed = FALSE)
+g <- simplify(g, remove.multiple = FALSE, remove.loops = TRUE)
+```
+
+## 2. Filtering Biological Noise: Isolating the Core Connectome
+
+When aggregating tractography data across 477 subjects, false positives caused by biological noise and scanning artifacts are a systemic issue. Furthermore, peripheral wiring is highly individualistic, sculpted by genetics and environment. To reveal the highly conserved structural backbone of the brain, the Core Connectome, we executed a consensus thresholding strategy. [@de_reus2013estimating]
+
+By systematically removing edges that appear in fewer than x subjects, we are executing a consensus thresholding strategy. The exact methodological standard used in network neuroscience to strip away noise and reveal the Core Connectome.
+
+The following code iteratively applies a stricter inclusion criterion (from 1 to 477 subjects) for every edge in the graph. At each step, it drops edges that do not meet the consensus threshold and measures a critical network property, the Proportion of Nodes in the Largest Connected Component (LCC).
+
+```{r, warning=FALSE}
+thresholds <- 1:477
+percolation_results <- data.frame(
+  Threshold = integer(), 
+  LCC_Proportion = numeric(), 
+  Density = numeric()
+)
+
+total_nodes <- vcount(g)
+
+for (x in thresholds) {
+  edges_to_keep <- E(g)[E(g)$occurences >= x]
+  sub_g <- igraph::subgraph.edges(g, eids = edges_to_keep, delete.vertices = FALSE)
+  comp <- components(sub_g)
+  lcc_size <- max(comp$csize)
+  lcc_proportion <- lcc_size / total_nodes
+  dens <- edge_density(sub_g)
+  percolation_results <- rbind(
+    percolation_results, 
+    data.frame(Threshold = x, LCC_Proportion = lcc_proportion, Density = dens)
+  )
+}
+
+p_lcc <- ggplot(percolation_results, aes(x = Threshold, y = LCC_Proportion)) +
+  geom_line(color = "#8e44ad", size = 1.2) +
+  geom_vline(xintercept = 238, linetype = "dashed", color = "gray50") +
+  theme_minimal() +
+  labs(
+    title = "Network Percolation: Largest Connected Component (LCC)",
+    subtitle = "Tracking network fragmentation as rare edges are removed",
+    x = "Occurrence Threshold (Number of Subjects)",
+    y = "Proportion of Nodes in Main Component"
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+print(p_lcc)
+```
+
+- `x-axis`: it represents the minimum number of subjects (out of the 477 total) that must possess a specific edge for that edge to be kept in the filtered network.
+
+- `y-axis`: tracks the proportion of nodes surviving in the Main Component.
+
+The plot shows that this network fragments gradually and steadily. By the time edges are restricted to those present in 50% of the population (the dashed line), we notice that only about 35% of the brain's nodes remain in the main network.
+
+The trend seems to be almost linear, network fragments piece by piece because highly connected hubs hold the core architecture together. The peripheral wiring of the brain is deeply individualistic, sculpted by a subject's unique environment, genetics, and cognitive habits. The edges that survive the strictest thresholds (the far right of the x-axis) represent the highly conserved structural backbone of the human brain.
+
+However, tractography algorithms frequently generate false positive connections, requiring us to carefully denoise the graph. This traditional approach applies a rigid group threshold (only keeping edges present within a fixed threshold between $30\%$ - $90\%$ of subjects [@de_reus2013estimating]).
+
+This cut-off assumes that false positives occur equally across the entire brain, introducing a severe geometric bias. In reality, MRI technology inherently struggles to trace very long nerve fibers, especially those bridging the two hemispheres naturally appear less often in the data [@roberts2017real]. Applying a strict occurrence threshold systematically erases these crucial long pathways, leading to an artificial fragmentation of the network. To prevent this, we implemented a denoising strategy that accounts for fiber length, rather than relying strictly on occurrence rates.
+
+### 2.1 Distance-Dependent Consensus Thresholding
+
+We now implement the following strategy for graph subsampling:
+
+To preserve the topological integrity of the network and capture low-occurrence, long-range structural highways without incorporating short-range biological noise, the consensus threshold was modeled as a dynamically decaying exponential function of the mean physical fiber length ($L$):
+
+$\text{Threshold}(L) = P_{\text{min}} + (P_{\text{max}} - P_{\text{min}}) \cdot e^{-\lambda \cdot L}$
+
+- $L$ (Mean Physical Fiber Length): The actual length of the connection in millimeters ($mm$). It serves as the independent variable: as $L$ increases, the required consensus threshold automatically drops.
+
+- $P_{\text{max}}$ (Maximum Threshold): The baseline threshold applied to **short connections** (set to $40\%$ of the subject sample). Because short tracts are easy for dMRI algorithms to reconstruct but are highly saturated with false-positive noise, a strict, high bar is required to prune them.
+
+- $P_{\text{min}}$ (Minimum Threshold): The floor asymptote applied to **long connections** (set to $1\%$ of the subject sample). Because tractography heavily struggles to track long-range pathways due to signal attenuation, a relaxed, low bar ensures that genuine cross-hemispheric highways are not accidentally deleted.
+
+- $\lambda$ (Lambda - Spatial Decay Rate): The exponential decay constant (set to $0.05$). It controls the mathematical curvature and velocity at which the threshold drops from $P_{\text{max}}$ to $P_{\text{min}}$ as fiber length increases.
+
+$\text{Short Fibers (Low } L) \implies \text{High Threshold } (P_{\text{max}}) \implies \text{Strict Noise Removal}$
+
+$\text{Long Fibers (High } L) \implies \text{Low Threshold } (P_{\text{min}}) \implies \text{Long-Range Highway Rescue}$
+
+```{r}
+TOTAL_SUBJECTS <- 477
+
+edge_df <- igraph::as_data_frame(g, what = "edges")
+node_df <- igraph::as_data_frame(g, what = "vertices")
+
+MAX_THRESH_PCT <- 0.4  
+LAMBDA_DECAY   <- 0.05  
+MIN_THRESH_PCT <- 0.01  
+
+edge_df <- edge_df %>%
+  mutate(
+    # Calculate the dynamic subject threshold for each specific edge
+    dynamic_thresh_pct = MIN_THRESH_PCT + (MAX_THRESH_PCT - MIN_THRESH_PCT) * 
+      exp(-LAMBDA_DECAY * fiber_length_mean),
+    dynamic_thresh_abs = round(dynamic_thresh_pct * TOTAL_SUBJECTS),
+    status = ifelse(occurences >= dynamic_thresh_abs, "kept", "removed"),
+    occurence_pct = occurences / TOTAL_SUBJECTS) %>%
+  # Anatomical mapping from nodes to edges
+  left_join(select(node_df, name, source_hemi = dn_hemisphere,
+                   source_reg = dn_region), by = c("from" = "name")) %>%
+  left_join(select(node_df, name, target_hemi = dn_hemisphere,
+                   target_reg = dn_region), by = c("to" = "name")) %>%
+  mutate(connection_type = ifelse(source_hemi == target_hemi,
+                                  "intra-hemispheric", "inter-hemispheric"))
+
+print(table(edge_df$status))
+
+tab_hemi <- table(edge_df$connection_type, edge_df$status)
+print(round(prop.table(tab_hemi, margin = 1), 3))
+
+
+filtered_edges <- edge_df %>% filter(status == "kept")
+g_filtered <- graph_from_data_frame(d = filtered_edges,
+                                    vertices = node_df,
+                                    directed = FALSE)
+
+comp <- components(g_filtered)
+cat("\n--- POST-CORRECTION TOPOLOGICAL METRICS ---\n")
+cat("Final Network Density:", round(edge_density(g_filtered), 4), "\n")
+cat("Proportion of Nodes in Giant Component (LCC):",
+    round(max(comp$csize) / vcount(g), 4), "\n")
+
+p_adaptive <- ggplot(edge_df, aes(x = fiber_length_mean, y = occurence_pct)) +
+  geom_point(aes(color = status), alpha = 0.3, size = 1) +
+  geom_line(aes(y = dynamic_thresh_pct), color = "#2c3e50", size = 1.2,
+            linetype = "solid") +
+  scale_color_manual(values = c("kept" = "#2e9acc", "removed" = "#e74d3cd2")) +
+  theme_minimal() +
+  labs(
+    title = "Distance-Dependent Consensus Thresholding",
+    subtitle = "The dark line represents the adaptive boundary compensating for tracking bias",
+    x = "Mean Fiber Length (mm)",
+    y = "Occurrence Frequency (% of subjects)",
+    color = "Edge Status"
+  ) +
+  theme(plot.title = element_text(face = "bold"))
+
+print(p_adaptive)
+```
+
+Compared to the fixed 50% threshold, this length based procedure yielded the following structural improvements:
+
+- **Inter-Hemispheric Recovery**: Relaxing the long-range boundary ($P_{\text{min}} = 0.01$, $\lambda = 0.05$) successfully rescues hard to detect, long distance fibers crossing between brain hemispheres that would have been removed with a fixed threshold [@roberts2017real; @betzel2019distance].
+
+- **Optimal Sparsification**: Instead of applying a blanket deletion, the adaptive filter intelligently pruned $60,841$ false positive short range edges, leaving exactly $9,813$ stable connections. This corresponds to a final network density of 2.73%, falling precisely within the ideal $2\% - 5\%$ mathematical sweet spot for high resolution topologies.
+
+- **Resolution of Graph Fragmentation**: The adaptive filter naturally restored the LCC to $83.65%$. The final clean connectome retains $849$ core integrated nodes [@fornito2016fundamentals].
+
+Finally, we extract the largest connected component to discard anatomically disconnected regions, establishing the integrated structural backbone for our main analysis.
+
+```{r}
+g_denoised <- induced_subgraph(g_filtered, vids = V(g_filtered)
+                               [comp$membership == which.max(comp$csize)])
+
+cat("--- FINAL CORE CONNECTOME ---\n")
+cat("Nodes in the final analyzed network:", vcount(g_denoised), "\n")
+cat("Edges in the final analyzed network:", ecount(g_denoised), "\n")
+cat("Final Network Density (Connected):", round(edge_density(g_denoised), 4),"\n")
+```
+
+## 3. Subgraph visualization
+
+Below is the visualization of the denoised connectome, rendered using the Fruchterman-Reingold force directed layout. This algorithm simulates a physical system to position the nodes: edges act as springs that pull connected regions together, while the nodes themselves exert a repulsive magnetic force against one another.
+
+```{r}
+node_degrees <- degree(g_denoised)
+V(g_denoised)$degree <- node_degrees
+
+top_10_threshold <- sort(node_degrees, decreasing = TRUE)[10]
+
+node_hemispheres <- V(g_denoised)$dn_hemisphere
+if (is.null(node_hemispheres)) {
+  node_hemispheres <- rep("Unknown", vcount(g_denoised)) 
+}
+
+V(g_denoised)$display_category <- case_when(
+  node_degrees >= top_10_threshold ~ "Hub",
+  node_hemispheres == "left" ~ "Left Hemisphere",
+  node_hemispheres == "right" ~ "Right Hemisphere",
+  TRUE ~ "Unknown"
+)
+
+p_network_mixed <- ggraph(g_denoised, layout = 'fr') + 
+  geom_edge_link(edge_colour = "#bdc3c7", edge_alpha = 0.2, edge_width = 0.5) +
+  geom_node_point(aes(size = degree, color = display_category), alpha = 0.9) +
+  scale_color_manual(
+    values = c(
+      "Hub" = "#f1c40f",            
+      "Left Hemisphere" = "#2980b9",   
+      "Right Hemisphere" = "#c0392b",
+      "Unknown" = "gray"),
+    name = "Anatomy & Hubs") +
+  scale_size_continuous(range = c(1, 8), name = "Node Degree") +
+  theme_void() + 
+  labs(
+    title = "Core Connectome Topology",
+    subtitle = "Central routing hubs highlighted in yellow") +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "#7f8c8d"),
+    legend.position = "bottom")
+
+print(p_network_mixed)
+```
+
+Even without explicit spatial coordinates, the force directed layout autonomously segregates the network into two distinct areas corresponding to the left (blue) and right (red) hemispheres.
+
+Node size is scaled proportionally to degree centrality, drawing attention to regions with the most connections. Lastly, the network's central routing hubs, defined as the nodes with the highest degree centrality, are highlighted in yellow. These hubs are visibly anchored deep within the dense structural core of their respective hemispheres.
+
+## 4. Degree and Strengths Distribution
+
+```{r}
+hist(degree(g_denoised))
+```
+
+The histogram displays a strongly right-skewed degree distribution with a pronounced heavy tail suggesting an heterogeneous behavior.
+
+The vast majority of brain regions possess a relatively small number of connections (low degree), while a minority of regions act as dense routing hubs with high degrees (\>100). This specific topology is a hallmark of complex biological systems.
+
+To determine whether our network is scale-free, our next analytical step is to test if this heavy tailed distribution formally follows a power law: $$f_d\propto d^{-\alpha}$$
+
+```{r, warning=FALSE}
+d_nodes <- degree(g_denoised) 
+dd_nodes <- degree_distribution(g_denoised)
+d <- 0:max(d_nodes) 
+ind <- dd_nodes != 0 
+
+plot(
+  log(d[ind] + 1),        
+  log(dd_nodes[ind]),
+  main = "Log-Log Degree Distribution",
+  xlab = "log(Degree + 1)",
+  ylab = "log(Probability)",
+  pch = 16,
+  col = "black"
+)
+
+dd_nodes <- degree_distribution(g_denoised)
+
+df <- data.frame(
+  degree = 0:(length(dd_nodes)-1),
+  prob = dd_nodes)
+df <- subset(df, degree > 0 & prob > 0)
+
+fit <- glm(prob ~ log(degree), data = df, family = poisson)
+summary(fit)
+
+alpha <- -coef(fit)[2]
+alpha
+abline(fit)
+```
+
+The difference between the log-log regression model and the Maximum Likelihood Estimation happens because these two methods are evaluating different structural aspects of the degree distribution. Regression attempts to find a "best fit" average across all nodes. However, because this biological data curves downward at the extreme ends, this global average incorporates that bend, resulting in a gentler overall slope. The MLE approach, conversely, is a specialized algorithm that strictly evaluates the extreme tail of the distribution. It mathematically isolates the most connected hubs (identifying the threshold at a degree of 57) and calculates the decay rate only within that upper range, yielding a steeper slope ($\alpha$ = 4.29).
+
+```{r}
+raw_degrees <- degree(g_denoised)
+raw_degrees <- raw_degrees[raw_degrees > 0]
+
+# Fit the power law using Maximum Likelihood Estimation
+power_fit <- fit_power_law(raw_degrees, implementation = "plfit", p.value=TRUE)
+print(power_fit)
+```
+
+The *fit_power_law()* function applies Maximum Likelihood Estimation combined with a Kolmogorov-Smirnov (KS) minimization approach based on the Clauset et al. framework (the Kolmogorov-Smirnov distance is a metric used to quantify the difference between two probability distributions).
+
+The algorithm operates in three distinct phases:
+
+1)  Optimal lower bound selection: The algorithm iteratively tests every possible lower bound ($x_{min}$). For each candidate, it computes the theoretical power law distribution and calculates the KS statistic to measure the maximum distance between the actual data and that theoretical line. The $x_{min}$ that minimizes the KS distance is selected.
+
+2)  Maximum Likelihood Estimation: Nodes with a degree below the chosen $x_{min}$ are truncated from the analysis. The algorithm then applies MLE strictly to the remaining heavy tail data to calculate the scaling exponent $\alpha$.
+
+3)  Goodness of fit via Bootstrapping: To calculate a reliable p-value, the function generates thousands of synthetic datasets drawn from a true power law distribution matching the estimated $\alpha$ and $x_{min}$ parameters (incorporating natural statistical noise). It measures the KS distance for each synthetic dataset and compares them to the empirical data's KS distance.
+
+The MLE analysis reveals three critical structural properties of the denoised network:
+
+- $\alpha$ = 4.29: The steep scaling exponent indicates that while hubs exist, the probability of finding exceptionally massive hubs decays much faster than in a classic scale-free network (where typically 2\<$\alpha$\<3).
+
+- $x_{min}$ = 57: The power law behavior only applies to the upper tail of the network (nodes with 57 or more connections).
+
+- *KS.p* = 0.4088: Because *p* \> 0.05, we fail to reject the null hypothesis, meaning that a power law model is a statistically plausible fit for the network tail.
+
+Metabolic and Physical Constraints: A pure scale-free network model assumes infinite capacity for node growth. In contrast, the human brain is physically restricted by the volume of the skull and metabolic boundaries. Axonal pathways require physical space and heavy ATP consumption. Consequently, if a brain region were to act as a true scale-free hub, it would require a biologically impossible volume of wiring and metabolic energy.
+
+Conclusion: The network exhibits power-law dynamics up to a specific threshold ($x_{min}$ = 57). However, because of the physical and metabolic constraints of the brain, the extreme tail of this distribution decays much faster ($\alpha$ = 4.29) than classic, unconstrained scale-free models ($2 < \alpha < 3$). The brain supports high degree hubs, but biology dictates a strict limit on their maximum size, forcing the probability of massive hubs to drop off sharply.
+
+### 4.1 Electrical Connectivity and Fiber Mean Count Strengths
+
+Here, we compute and compare node strength across two distinct biological modalities: structural capacity (weighted by mean fiber count) and functional signaling capacity (weighted by median electrical connectivity).
+
+```{r}
+V(g_denoised)$strength_fiber <- strength(g_denoised, weights = 
+                                           E(g_denoised)$fiber_count_mean) 
+V(g_denoised)$strength_electrical <- strength(g_denoised, 
+                                              weights = E(g_denoised)
+                                              $electrical_connectivity_median) 
+
+node_stats <- data.frame(
+  Node = V(g_denoised)$name, 
+  Degree = V(g_denoised)$degree,
+  Strength_Fiber = V(g_denoised)$strength_fiber,
+  Strength_Electrical = V(g_denoised)$strength_electrical
+)
+
+node_stats <- subset(node_stats, Strength_Electrical > 0 & Strength_Fiber > 0)
+
+p1 <- ggplot(node_stats, aes(x = Strength_Electrical)) +
+  geom_histogram(bins = 50, fill = "#2980b9", color = "white", alpha = 0.8) +
+  scale_x_log10() +
+  theme_minimal() +
+  labs(
+    title = "Electrical Strength",
+    subtitle = "Weighted by electrical connectivity",
+    x = "Strength (Log Scale)",
+    y = "Count of Regions"
+  )
+
+p2 <- ggplot(node_stats, aes(x = Strength_Fiber)) +
+  geom_histogram(bins = 50, fill = "#2980b9", color = "white", alpha = 0.8) +
+  scale_x_log10() +
+  theme_minimal() +
+  labs(
+    title = "Fiber Strength",
+    subtitle = "Weighted by mean fiber count",
+    x = "Strength (Log Scale)",
+    y = "Count of Regions"
+  )
+
+p1 + p2
+```
+
+The central peaks indicate that the vast majority of brain regions operate at a standard, moderate level of biological wiring and energy consumption.
+
+The right tails of both distributions (extending past 1,000 for fibers and 10 for electrical) confirm the existence of highly integrated hub regions. These hubs aggregate massive amounts of physical white matter and electrical signaling capacity, acting as the primary information routers for the rest of the network.
+
+### 4.2 Mapping Structural and Electrical Hubs
+
+We identify the network's primary hubs by ranking nodes according to their accumulated fiber count and electrical strength. After mapping the hubs to their true anatomical brain regions, we analyze their biological efficiency by computing an electrical-to-fiber strength ratio. This metric reveals which structural centers provide the highest functional signaling output per physical connection.
+
+```{r}
+node_stats <- node_stats %>%
+  mutate(Node_ID = as.integer(as.character(Node)))
+node_stats = as_tibble(node_stats)
+
+hub_anatomical_denoised <- node_stats %>%
+  left_join(nodes, by = c("Node_ID" = "X..index")) %>%
+  select(
+    Node_ID, 
+    Anatomical_Name = dn_name, 
+    Hemisphere = dn_hemisphere,
+    Degree, 
+    Strength_Fiber, 
+    Strength_Electrical
+  )
+
+top_structural_hubs_denoised <- hub_anatomical_denoised %>%
+  arrange(desc(Strength_Fiber)) %>%
+  head(10) %>%
+  as_tibble()
+
+cat("TOP 10 NODES BY FIBER STRENGTH\n")
+print(top_structural_hubs_denoised)
+```
+
+```{r}
+top_electrical_hubs_denoised <- hub_anatomical_denoised %>%
+  arrange(desc(Strength_Electrical)) %>%
+  head(10) %>%
+  as_tibble()
+
+cat("TOP 10 ELECTRICAL HUBS \n")
+print(top_electrical_hubs_denoised)
+```
+
+```{r}
+efficiency_ratio_denoised <- hub_anatomical_denoised %>%
+  arrange(desc(Strength_Fiber)) %>%
+  head(10) %>%
+  mutate(elec_per_fiber = Strength_Electrical / Strength_Fiber) %>%
+  arrange(desc(elec_per_fiber)) %>%
+  select(Node_ID, Anatomical_Name, Strength_Fiber, Strength_Electrical, elec_per_fiber) %>%
+  as_tibble()
+
+cat("EFFICIENCY RATIO FOR TOP 10 STRUCTURAL HUBS \n")
+print(efficiency_ratio_denoised)
+```
+
+The data reveals three major biological realities:
+
+1)  Subcortical Structures are the Brain's Core Routers: eight of the top ten hubs are subcortical structures (the Putamen, Caudate, Hippocampus, and Thalamus). The Thalamus acts as the brain's primary sensory complex. Putamen and Caudate are the command centers for motor control, decision making, and reward processing. The Hippocampus is the core of memory consolidation. Because they must constantly synthesize vast amounts of data from across the entire brain, they demand immense information bandwidth. This biological necessity explains why these specific structures require high intensity both in physical fibers and electrical strength.
+
+2)  Biological Symmetry: The data demonstrates almost perfect structural symmetry. For every right hemisphere hub its left hemisphere counterpart appears right next to it in the ranking. This structural mirroring serves as a validation that the prior data cleaning and denoising steps were accurate.
+
+3)  Caudate vs Putamen: The efficiency ratio reveals that the brain uses two completely different strategies to build its major hubs. The Putamen relies on physical bulk, acting like a massive highway to move traffic. In contrast, the Caudate relies on functional efficiency, it has 30% fewer physical connections, but those connections are highly optimized to transmit electrical signals.
+
+## 5. Centrality measures
+
+While node degree and strength tell us about a brain region's local capacity, they do not capture its strategic role within the network. To understand how information flows across the entire brain, we must analyze the network's topology using centrality measure (betweenness).
+
+The distance between two nodes is computed as the inverse of their physical connection strength (computed as 1 / fiber_count). In neuroanatomy, a high number of nerve fibers acts like a massive information highway. By inverting this value, robust connections are treated as extremely short pathways. Consequently, algorithms routing information across the network will favor these dense connections.
+
+```{r}
+E(g_denoised)$distance <- 1 / (E(g_denoised)$fiber_count_mean + 1e-6)
+
+V(g_denoised)$betweenness <- betweenness(g_denoised, 
+                                         weights = E(g_denoised)$distance,
+                                         directed = FALSE)
+
+hub_anatomical_denoised <- hub_anatomical_denoised %>%
+  mutate(
+    Betweenness = V(g_denoised)$betweenness)
+    
+top_bottlenecks_denoised <- hub_anatomical_denoised %>%
+  arrange(desc(Betweenness)) %>%
+  select(Node_ID, Anatomical_Name, Degree, Betweenness) %>%
+  head(5)
+
+print("Top 5 Central nodes:")
+print(top_bottlenecks_denoised)
+
+top_bottlenecks_labels <- hub_anatomical_denoised %>%
+  arrange(desc(Betweenness)) %>%
+  head(4)
+
+p_vulnerability_denoised <- ggplot(hub_anatomical_denoised,
+                                   aes(x = Degree, y = Betweenness)) +
+  geom_point(alpha = 0.4, color = "#7f8c8d", size = 2) +
+  geom_point(data = top_bottlenecks_labels, color = "#e74c3c", size = 3.5) +
+  geom_label_repel(data = top_bottlenecks_labels, aes(label = Anatomical_Name),
+                   size = 3.5, box.padding = 0.6, max.overlaps = 15) +
+  theme_minimal() +
+  labs(
+    title = "Core Network Vulnerability: Degree vs Betweenness",
+    x = "Degree",
+    y = "Betweenness Centrality"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold")
+  )
+
+print(p_vulnerability_denoised)
+```
+
+The scatter plot illustrates a structural hierarchy within the network, mapping a region's total connections (Degree) against its global routing power (Betweenness). This visualization reveals that the majority of brain regions cluster along the bottom axis. This indicates that while they possess moderate local connectivity, they hold no global routing responsibility. In contrast, the Left and Right hemispheres of the Caudate and Putamen detach entirely from the rest of the distribution, making the brain a highly centralized topology. However, it highlights a structural vulnerability: the network relies mainly on this hubs to prevent the cortex from functionally fragmenting.
+
+### 5.1 Strength vs Betweenness
+
+We can derive the same conclusions by inspecting the relation with respect to strengths instead of degrees as in previous plot.
+
+```{r}
+top_fiber <- hub_anatomical_denoised %>%
+  arrange(desc(Strength_Fiber)) %>%
+  slice_head(n = 4)
+
+top_electrical <- hub_anatomical_denoised %>%
+  arrange(desc(Strength_Electrical)) %>%
+  slice_head(n = 4)
+
+p_fiber_betweenness <- ggplot(
+  hub_anatomical_denoised,
+  aes(x = Strength_Fiber, y = Betweenness)
+) +
+  geom_point(alpha = 0.6, color = "#3498db", size = 2) +
+  
+  
+  geom_label_repel(
+    data = top_fiber,
+    aes(label = Anatomical_Name),
+    size = 3.5
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Fiber Strength vs Betweenness",
+    x = "Total Fiber Strength",
+    y = "Betweenness Centrality"
+  )
+
+p_electrical_betweenness <- ggplot(
+  hub_anatomical_denoised,
+  aes(x = Strength_Electrical, y = Betweenness)
+) +
+  geom_point(alpha = 0.6, color = "#27ae60", size = 2) +
+  
+
+  geom_label_repel(
+    data = top_electrical,
+    aes(label = Anatomical_Name),
+    size = 3.5
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Electrical Strength vs Betweenness",
+    x = "Total Electrical Strength",
+    y = "Betweenness Centrality"
+  )
+
+(p_fiber_betweenness | p_electrical_betweenness) +
+  plot_annotation(
+    title = "Core Connectome Hub Architecture",
+  )
+```
+
+### 5.2 Simulation on Neurodegenerative Desease vs Random Failure
+
+Previously, the centrality analysis identified a structural vulnerability: the core network relies mainly on a tiny fraction of subcortical hubs to prevent the cortex from functionally fragmenting. To verify this hypothesis and explore its clinical implications, we simulated a progressive "lesion" model. We systematically removed nodes and tracked the size of the Largest Connected Component (LCC).
+
+The simulation compared two distinct biological scenarios:
+
+**Random Failure**: Nodes are removed uniformly at random, simulating the cell loss typical of normal aging.
+
+**Targeted Attack**: Nodes are removed strictly in descending order of their degree (highest hubs first), simulating the specific pathological progression of neurodegenerative diseases.
+
+```{r}
+get_lcc_proportion <- function(graph, original_node_count) {
+  if (vcount(graph) == 0) return(0)
+  comp <- components(graph)
+  return(max(comp$csize) / original_node_count)
+}
+
+total_nodes <- vcount(g_denoised)
+nodes_to_remove <- seq(1, total_nodes, by = 5) 
+
+degree_scores <- degree(g_denoised)
+targeted_order <- V(g_denoised)[order(degree_scores, decreasing = TRUE)]
+
+set.seed(42) 
+random_order <- V(g_denoised)[sample(1:total_nodes)]
+results_list <- list()
+
+for (i in seq_along(nodes_to_remove)) {
+  n_remove <- nodes_to_remove[i]
+  fraction_removed <- n_remove / total_nodes
+  
+  g_target <- delete_vertices(g_denoised, targeted_order[1:n_remove])
+  lcc_target <- get_lcc_proportion(g_target, total_nodes)
+  
+  g_random <- delete_vertices(g_denoised, random_order[1:n_remove])
+  lcc_random <- get_lcc_proportion(g_random, total_nodes)
+  
+  results_list[[i]] <- data.frame(
+    Fraction_Removed = rep(fraction_removed, 2),
+    LCC_Proportion = c(lcc_target, lcc_random),
+    Strategy = c("Targeted Attack (Hubs First)", "Random Failure")
+  )
+}
+
+resilience_results <- bind_rows(results_list)
+
+p_resilience <- ggplot(resilience_results, aes(x = Fraction_Removed,
+                                               y = LCC_Proportion,
+                                               color = Strategy)) +
+  geom_line(linewidth = 1.2) + 
+  scale_color_manual(values = c(
+    "Random Failure" = "#502ecc", 
+    "Targeted Attack (Hubs First)" = "#e74c3c"
+  )) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Core Network Resilience: Simulated Brain Lesions",
+    subtitle = "Tracking fragmentation under random trauma vs targeted neurodegeneration",
+    x = "Fraction of Nodes Removed",
+    y = "Proportion of Nodes in Main Component (LCC)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_resilience)
+```
+
+The simulation reveals that when the brain suffers diffuse, random damage, its topology is incredibly resilient. Even after 25% of the network's nodes are completely wiped out, the main connected component maintains nearly 70% of its structural integrity. Because the majority of brain regions only handle local processing, the loss of these peripheral nodes does not disrupt global communication.
+
+In contrast, the network is exceptionally fragile against a targeted attack on its hubs. At the exact same 25% removal threshold where the random failure model remains largely intact, the targeted attack network is completely annihilated. In fact, true systemic collapse occurs much earlier.
+
+This mathematical collapse perfectly mirrors the clinical progression of neurodegenerative conditions like Alzheimer's Disease and Frontotemporal Dementia. These diseases do not destroy brain tissue randomly. Because the elite hubs (like the Basal Ganglia and Hippocampus) are constantly routing massive amounts of brain traffic, they are exceptionally metabolically active and energetically expensive. This high metabolic burden makes them prone for toxic protein accumulation (such as Amyloid plaques and Tau tangles). Consequently, neurodegeneration naturally acts as a "targeted attack" on the brain's highest degree nodes, explaining why these specific diseases cause such rapid and catastrophic cognitive fragmentation compared to normal aging.
+
+## 6. Communities Detection
+
+The human brain operates on a principle of modularity: it functionally segregates into specialized local neighborhoods that handle specific tasks, such as visual processing or motor control.
+
+To map these neighborhoods, we applied the **Louvain Community Detection** algorithm [@Blondel et Al, 2008]. This algorithm optimizes modularity, a measure introduced by Newman (2004) that quantifies how much the density of edges within communities exceeds what would be expected under a null random graph model with the same degree sequence.
+
+Louvain finds this partition through two alternating phases: in Phase 1, each node is tentatively moved to the community of each neighbor; the move that maximally increases modularity is accepted, repeating until no improvement is possible.
+
+In Phase 2, each community is collapsed into a super-node and the process restarts on the compressed network. This naturally yields a hierarchical community structure at multiple scales, with O(Nlog⁡N) complexity, well suited for large sparse graphs like structural connectomes, since the algorithm scans the network to find groups of nodes that are densely connected to one another but sparsely connected to the rest of the brain.
+
+To visualize this modular architecture, we reordered the network's adjacency matrix, sorted by Louvain assigned community, hemisphere and by degree.
+
+```{r}
+communities <- cluster_louvain(g_denoised)
+V(g_denoised)$community <- as.character(membership(communities))
+
+node_metadata <- data.frame(
+  Node_Name = V(g_denoised)$name,
+  Hemisphere = V(g_denoised)$dn_hemisphere,
+  Community = V(g_denoised)$community,
+  Degree = V(g_denoised)$degree
+) %>%
+  arrange(Hemisphere, Community, desc(Degree))
+
+ordered_node_names <- node_metadata$Node_Name
+
+adj_matrix <- as_adjacency_matrix(g_denoised, sparse = FALSE)
+adj_matrix_sorted <- adj_matrix[ordered_node_names, ordered_node_names]
+
+adj_df <- as.data.frame(as.table(adj_matrix_sorted)) %>%
+  filter(Freq > 0)
+
+adj_df$Var1 <- factor(adj_df$Var1, levels = ordered_node_names)
+adj_df$Var2 <- factor(adj_df$Var2, levels = rev(ordered_node_names)) 
+
+p_light_smart_heatmap <- ggplot(adj_df, aes(x = Var1, y = Var2)) +
+  geom_point(color = "#2c3e50", size = 0.3, shape = 15, alpha = 0.8) + 
+  theme_minimal() +
+  labs(
+    title = "Core Connectome Adjacency Matrix: Mathematical Modularity",
+    subtitle = "Nodes ordered by Louvain Community Detection to reveal true structural cliques",
+    x = "Nodes (Community Sorted)",
+    y = "Nodes (Community Sorted)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "black"),
+    plot.subtitle = element_text(size = 12, color = "#7f8c8d"),
+    axis.title = element_text(face = "bold", color = "black"),
+    axis.text = element_blank(), 
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+print(p_light_smart_heatmap)
+```
+
+The high density along the diagonal confirms strong intra-community wiring, while the sparse off-diagonal reflects a wiring economy where inter-community connections are rare (Bullmore & Sporns, 2012). Crucially, these residual inter-community ties are not random; they are denser within the same hemisphere than across contralateral sides due to the anatomical cost of long-range transcallosal projections.
+
+This spatial structure also motivates the choice of Louvain over a Stochastic Block Model (SBM). SBM is a probabilistic model that assumes the network was produced by a specific edge-generation mechanism: it estimates connection probability parameters $\pi_{qr}$ and assigns nodes to blocks that best fit them, requiring the number of blocks $K$ to be specified a priori.
+
+Louvain instead determines the number of communities automatically by optimizing modularity: at each step it reads the adjacency matrix directly, counting the actual edges between a node and each candidate community and asking whether that count exceeds what a random baseline would predict given the nodes' degrees. No parameters are estimated and no generative assumptions are imposed, making the resulting communities directly grounded in the observed wiring of the connectome.
+
+Having established the existence of distinct structural modules, our next critical step is to decode their biological identities. To achieve this, we mapped the network nodes back to their broader parent anatomical structures labels from `dn_fsname`. The resulting frequency data provides profound evidence that these communities are not random mathematical artifacts, but rather highly organized, functionally and spatially segregated biological systems.
+
+```{r}
+clean_louvain_metadata <- data.frame(
+  Node_Name = V(g_denoised)$name,
+  Community = V(g_denoised)$community, 
+  stringsAsFactors = FALSE
+) %>%
+  mutate(Match_ID = as.integer(Node_Name)) %>%
+  left_join(nodes %>% select(X..index, dn_fsname), by = c("Match_ID" = "X..index")) %>%
+  mutate(base_fsname = gsub("_[0-9]+$", "", dn_fsname))
+
+total_nodes <- nrow(clean_louvain_metadata)
+
+global_frequencies_louvain <- clean_louvain_metadata %>%
+  group_by(base_fsname) %>%
+  summarise(
+    Global_Count = n(),
+    Global_Percentage = (Global_Count / total_nodes) * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Global_Percentage))
+
+community_frequencies_louvain <- clean_louvain_metadata %>%
+  group_by(Community) %>%
+  mutate(Community_Total = n()) %>%
+  group_by(Community, base_fsname) %>%
+  summarise(
+    Region_Count = n(),
+    Community_Total = first(Community_Total),
+    Community_Percentage = (Region_Count / Community_Total) * 100,
+    .groups = "drop"
+  ) %>%
+  # --- Join global data and calculate the ratio ---
+  left_join(global_frequencies_louvain %>% select(base_fsname, Global_Percentage), by = "base_fsname") %>%
+  mutate(Ratio = Community_Percentage / Global_Percentage) %>%
+  # ----------------------------------------------------------------
+  arrange(as.numeric(Community), desc(Community_Percentage))
+
+cat("\n--- GLOBAL DATASET FREQUENCIES (Top 15) ---\n")
+print(kable(head(global_frequencies_louvain, 15), digits = 2, format = "markdown"))
+
+top_regions_louvain <- community_frequencies_louvain %>%
+  group_by(Community) %>%
+  slice_max(order_by = Community_Percentage, n = 5, with_ties = FALSE) %>%
+  ungroup()
+
+cat("\n--- LOUVAIN WITHIN-COMMUNITY FREQUENCIES WITH RATIO (Top 5 per cluster) ---\n")
+print(kable(top_regions_louvain, digits = 2, format = "markdown"))
+```
+
+**Communities 1 and 3**: These two communities possess nearly identical anatomical profiles. Both are dominated by the superiorfrontal, precentral, rostralmiddlefrontal, and postcentral regions. Biologically, these structures form the brain's primary executive and sensorimotor networks. They are responsible for decision making, planning, and executing physical movement.
+
+**Communities 2 and 4**: These communities are built from the inferiorparietal, lateraloccipital, fusiform, and temporal regions. This specific grouping forms the brain's sensory, auditory, and visual processing systems, dedicated to recognizing objects, processing language, and integrating sensory data.
+
+A remarkable finding from the frequency data is the evidence of biological symmetry. The data does not show one giant motor or visual module. Instead, it shows two of each. Because inter hemispheric communication is structurally limited, the algorithm naturally split the brain cleanly down the middle.
+
+The computed ratios provide a confirmation of true biological specialization within the communities. A ratio of 1.0 would indicate that a region's presence within a community is purely a side effect of its large global size. However, all regions across the communities exhibit ratios greater than 1, proving the algorithm actively aggregated these specific structures into functional modules.
+
+## 7. Ergm Model Fit
+
+```{r, warning = FALSE, message = FALSE}
+g_network <- intergraph::asNetwork(g_denoised)
+
+# Extract numbers from the X_pos string (handles signs and decimals safely)
+coords_list <- str_extract_all(node_df$X_pos, "[-+]?[0-9]*\\.?[0-9]+")
+
+# Extract the first element (X-coordinate) for each node and convert to numeric
+x_coordinate <- sapply(coords_list, function(x) {
+  if(length(x) >= 1) return(as.numeric(x[1]))
+  else return(NA)
+})
+
+# Assign the continuous spatial vector as a vertex attribute in the network object
+g_network %v% "coord_X" <- x_coordinate
+
+# Model 1
+# Captures the baseline network density (intercept-only model)
+ergm_base_model <- ergm(g_network ~ edges)
+summary(ergm_base_model)
+
+
+# Model 2
+# Implements dyadic independent terms to test left-right brain asymmetry
+fit_brain_lateral <- ergm(
+  g_network ~ 
+    edges + 
+    nodecov("coord_X") +          
+    nodefactor("dn_hemisphere") + 
+    nodematch("dn_hemisphere")    
+)
+summary(fit_brain_lateral)
+
+
+# Model 3
+# Integrates both Left-Right and Center-Periphery axes to control for confounding effects.
+fit_brain_complete <- ergm(
+  g_network ~ 
+    edges + 
+
+    nodecov("coord_X") + 
+    nodefactor("dn_hemisphere") + 
+    nodematch("dn_hemisphere") +
+    
+    nodefactor("dn_region") + 
+    nodematch("dn_region")
+)
+summary(fit_brain_complete)
+```
+
+The analysis follows a progressive integration of spatial, hemispheric, and anatomical variables to model the generative mechanisms of the structural brain network. Since we are dealing exclusively with dyadic independent terms, the Exponential Random Graph Model (ERGM) is equivalent to a logistic regression on adjacency weights, with additive effects coming from nodes attributes.
+
+Based on our empirical setup, starting from a baseline model (Model 1) implemented using as predictor only the sufficient statistic $\alpha$, we gradually add terms until we arrive to the full formulation (Model 3), which estimates the log-odds of a structural connection between node $i$ and node $j$ using the following specification:
+
+$$\text{log-odds}(A_{ij}) = \alpha + (x_i + x_j)\beta + \sum_{k \neq 1} (f_{ik} + f_{jk})\gamma_k + \sum_{h \neq 1} (g_{ih} + g_{jh})\psi_h + I(m_i = m_j)\delta_1 + I(r_i = r_j)\delta_2$$
+
+Where:
+
+- $\alpha$ is the network intercept (number of edges).
+
+- $\beta$ is the continuous effect of the left-right spatial coordinate (nodecov.coord_X).
+
+- $\gamma_k$ captures the main effect of hemisphere (nodefactor("dn_hemisphere")), estimating whether nodes in the right hemisphere are systematically more or less connected than those in the left, taken as the reference level.
+
+- $\psi_h$ captures the main effect of cortical class (nodefactor("dn_region")), estimating whether subcortical nodes are systematically more or less connected than cortical ones, taken as the reference level.
+
+- $\delta_1$ captures the effect for the hemisphere when the factor level is the same among both nodes $i$ and $j$(nodematch("dn_hemisphere")).
+
+- $\delta_2$ captures the effect for the anatomical region when the factor level is the same among both nodes $i$ and $j$ (nodematch("dn_region")).
+
+#### Model 1: Baseline Network Density (`ergm_base_model`)
+
+This baseline model regressed only on the intercept captures the global structural density without conditioning on any node-level covariates.
+
+- `edges` = -3.57469 ($p < 0.0001$)
+
+  The log-odds of observing an edge between any pair of nodes is $-3.57$. This translates to a baseline connection probability of approximately $2.74\%$ ($\text{logit}^{-1} = \frac{1}{1 + e^{-3.57469}} \approx 0.0274$): this is equal to the graph density found in paragraph 2.1.
+
+It reflects the sparsity of the structural connectome. The vast majority of theoretically possible connections are not anatomically realized.
+
+#### Model 2: Brain Asymmetry and Lateralization (`fit_brain_lateral`)
+
+This specification introduces dyadic independent terms to test left-right brain effect using the continuous MNI coordinate $X$ and categorical hemispheric indicators.
+
+- `edges` = -9.33406 ($p < 0.0001$)
+
+  The intercept represents the log-odds of a tie between two theoretical baseline nodes located at $X = 0$ (in the medial plane), in the Left Hemisphere, and belonging to different hemispheres since nodematch.dn_hemisphere is 0.
+
+- `nodecov.coord_X` = -0.90299 ($p < 0.0001$)
+
+  In standard MNI space, negative $X$ values correspond to the Left Hemisphere, while positive values correspond to the Right Hemisphere. A negative coefficient shows that as we move rightward, the baseline propensity to wire decreases linearly. The Left Hemisphere acts as a denser, more interconnected core, aligning with neurobiological theory.
+
+- `nodefactor.dn_hemisphere.right` = -0.15173 ($p < 0.0001$)
+
+  With the Left Hemisphere acting as the implicit baseline level, this negative coefficient indicates that even after controlling for the continuous spatial coordinates ($X$), the Right Hemisphere as a categorical block displays a lower baseline connectivity.
+
+- `nodematch.dn_hemisphere` = 5.41610 ($p < 0.0001$)
+
+  Demonstrates a massive hemispheric homophily effect. Holding all else constant, intra-hemispheric connections are exponentially more likely to occur than inter-hemispheric (commissural) ones, highlighting a strong biological and anatomical barrier.
+
+#### Model 3: Comprehensive Axes Integration (`fit_brain_complete`)
+
+This model integrates both Left-Right and Center-Periphery (cortical vs subcortical) axes. This step is crucial because subcortical structures lie close to the midline ($X \approx 0$) and act as major confounders if left unmodeled.
+
+- `edges` = -13.77423 ($p < 0.0001$)
+
+  It becomes even more negative, now representing the log-odds of an inter-hemispheric tie between two cortical nodes at the medial plane ($X=0$) in the Left Hemisphere, a more penalized baseline once the contribution of subcortical structures is explicitly isolated and controlled for.
+
+  Notice that `nodecov.coord_X` sharpens from -0.90 to -1.77 and `nodefactor.dn_hemisphere.right` drops from -0.15 to -0.28. Once the massive routing effect of deep subcortical structures is isolated and controlled for, the true strength of the Left Hemisphere's cortical density gradient is revealed.
+
+- `nodefactor.dn_region.subcortical` = 4.60273 ($p < 0.0001$)
+
+  Mathematically validates deep subcortical structures (e.g., thalamus, hippocampus) as central anatomical hubs. They exhibit an immense baseline connectivity, acting as the primary routing core (*rich club*) of the network.
+
+- `nodematch.dn_region` = 2.43320 ($p < 0.0001$)
+
+  Highlights strong tissue-specific homophily: nodes preferentially wire with others of the same tissue type.
+
+Notice that the use of `nodematch(..., diff = TRUE)` is not viable for either categorical variable in this model. When a variable has exactly two levels, as is the case for both dn_hemisphere (left/right) and dn_region (cortical/subcortical), only three dyad types are possible (AA, BB and AB), spanning a 2-dimensional space. Introducing both nodefactor contrasts and both nodematch indicators simultaneously over-parameterizes the model: one parameter is always a linear combination of the others.
+
+The aggregated nodematch specification, which collapses the two match types into a single homophily parameter, resolves the redundancy and is therefore the appropriate choice for both terms.
+
+A comparison of information criteria and residual deviance highlights improvement across specifications:
+
+| Model        | Parameters |  AIC   |  BIC   | Residual Deviance |
+|:-------------|:----------:|:------:|:------:|:-----------------:|
+| M1: Baseline |     1      | 90,057 | 90,068 |      90,055       |
+| M2: Lateral  |     4      | 76,640 | 76,683 |      76,632       |
+| M3: Complete |     6      | 72,426 | 72,491 |      72,414       |
+
+It seems that Model 3 is the superior model, yielding the lowest AIC and BIC, but let's perform an ANOVA test to test if this is true:
+
+```{r}
+# Test 1: Impact of the Lateral Axis
+anova_lateral_impact <- anova(ergm_base_model, fit_brain_lateral)
+
+cat("\n--- TEST 1: LATERAL SPATIAL AXIS SIGNIFICANCE ---\n")
+print(anova_lateral_impact)
+
+
+# Test 2: Added Value of the Depth Axis
+anova_depth_added_value <- anova(fit_brain_lateral, fit_brain_complete)
+
+cat("\n--- TEST 2: DEPTH AXIS ADDED VALUE ---\n")
+print(anova_depth_added_value)
+```
+
+For ERGMs with dyadic independent terms, the Analysis of Deviance (ANOVA) operates exactly like the Likelihood Ratio Test (LRT) in Generalized Linear Models. The Residual Deviance is defined as: Deviance = $-2 \times LogLikelihood$.
+
+When comparing nested models, the difference in deviance (Delta Deviance) asymptotically follows a Chi-Square distribution under the null hypothesis, with degrees of freedom (df) equal to the difference in the number of parameters.
+
+#### Test 1: Significance of the Lateral Spatial Axis
+
+Comparison: `ergm_base_model` (M1: Intercept only) vs `fit_brain_lateral` (M2)
+
+- Null Hypothesis ($H_0$): $\beta = 0 \cap \gamma_{\text{right}} = 0 \cap \delta_1 = 0$
+
+  Controlling for global network density, neither the continuous lateral gradient (`coord_X`), the categorical main effect of the hemisphere (`dn_hemisphere`), nor hemispheric homophily (`nodematch`) have any effect on wiring probability. The spatial layout across the left-right axis is topologically neutral.
+
+- Alternative Hypothesis ($H_1$): At least one of the lateral spatial parameters ($\beta, \gamma_{\text{right}}, \delta_1$) is significantly different from zero.
+
+This Chi-Square ($\chi^2$) test evaluates whether the drop in Residual Deviance from M1 to M2 ($90,055$ to $76,632$) is large enough to justify the addition of 3 degrees of freedom. Given the significant p-value ($p < 0.001$), we confidently reject $H_0$. This massive reduction in deviance demonstrates that the conditional log-odds of a connection are structurally dependent on left-right hemispheric boundaries and geometric gradients.
+
+#### Test 2: Added Value of the Center-Periphery (Depth) Axis
+
+Comparison: `fit_brain_lateral` (M2) vs `fit_brain_complete` (M3: Full Model)
+
+- Null Hypothesis ($H_0$): $\psi_{\text{subcortical}} = 0 \cap \delta_2 = 0$
+
+  Given that lateral spatial properties are already accounted for, the structural distinction between cortical and subcortical regions provides no additional topological information. The parameters for subcortical main effects and regional tissue homophily are jointly equal to zero.
+
+- Alternative Hypothesis ($H_1$): At least one of the depth/tissue parameters ($\psi_{\text{subcortical}}, \delta_2$) is significantly different from zero.
+
+This test evaluates whether expanding the nested model by 2 additional degrees of freedom ($\psi_{\text{subcortical}}$ and $\delta_2$) yields a significant increase in log-likelihood. The empirical Delta Deviance ($76,632$ to $72,414$) is mathematically massive compared to a standard $\chi^2$ distribution with 2 df. With a significant p-value ($p < 0.001$), we reject $H_0$. We conclude that the center-periphery axis explains a substantial portion of network variance that the lateral axis cannot capture alone, proving that subcortical structures alter the global wiring topology.
+
+## 8. References
+
+Blondel, V. D., Guillaume, J.-L., Lambiotte, R., & Lefebvre, E. (2008). Fast unfolding of communities in large networks. *Journal of Statistical Mechanics: Theory and Experiment*, 2008(10), P10008.
+
+de Reus, M. A., & van den Heuvel, M. P. (2013). Estimating false positives and negatives in brain networks. *NeuroImage*, 70, 402–409.
+
+Betzel, R. F., Griffa, A., Hagmann, P., & Mišić, B. (2019). Distance-dependent consensus thresholds for generating group-representative structural brain networks. *Network Neuroscience*, 3(2), 475–496.
+
+Newman, M. E. J. (2004). Fast algorithm for detecting community structure in networks. *Physical Review E*, 69(6), 066133.
