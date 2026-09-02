@@ -1,7 +1,7 @@
 #  Network Data: Human Connectome Analysis
 
 ![Language](https://img.shields.io/badge/Language-R-blue)
-![Course](https://img.shields.io/badge/Course-Statistical and Computational Methods for Network Data-brightgreen)
+![Course](https://img.shields.io/badge/Course-Statistical_and_Computational_Methods_for_Network_Data-brightgreen)
 ![Status](https://img.shields.io/badge/Status-Completed-success)
 
 ##  Overview
