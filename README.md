@@ -44,10 +44,10 @@ We fit multiple ERGMs to understand the probabilistic rules of brain wiring. Our
 * There is a strong homophily based on tissue type and hemisphere.
 * Subcortical structures exhibit a massive, statistically significant propensity to form connections compared to peripheral regions.
 
-## 🚀 How to Reproduce this Project
+##  How to Reproduce this Project
 
 This project uses `renv` to ensure full reproducibility and to lock package versions.
 
 1. Clone this repository:
    ```bash
-   git clone [https://github.com/giorgiacappellato/human-connectome-analysis.git]
+   git clone [https://github.com/giorgiacappellato/human-connectome-analysis.git](https://github.com/giorgiacappellato/human-connectome-analysis.git)
