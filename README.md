@@ -50,4 +50,4 @@ This project uses `renv` to ensure full reproducibility and to lock package vers
 
 1. Clone this repository:
    ```bash
-   git clone [https://github.com/yourusername/human-connectome-analysis.git](https://github.com/yourusername/human-connectome-analysis.git)
+   git clone [https://github.com/giorgiacappellato/human-connectome-analysis.git]
